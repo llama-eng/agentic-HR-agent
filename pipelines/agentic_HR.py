@@ -150,7 +150,7 @@ class Pipeline:
         if self.valves.DEBUG:
             print("------------------DEBUG MODE : ON--------------------", '\n')
         else:
-            print("------------------DEBUG MODE : OFF--------------------", '\n')
+            print("------------------DEBUG MODE : OFF-------------------", '\n')
 
         self.debug("PIPE FUNCTION ACTIVATED")
         self.token =  self.valves.TOKEN
