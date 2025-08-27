@@ -13,11 +13,24 @@ from typing import List
 from typing import List, Union, Generator, Iterator
 from typing import ClassVar
 import os
+import re
 from typing import List
 from pydantic import BaseModel, Field
+import requests
 
+from langchain_openai import ChatOpenAI #langgraph
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import MessagesState
+from langgraph.graph import START, StateGraph, END
+from typing_extensions import TypedDict
+from typing import Literal
+from langgraph.checkpoint.memory import MemorySaver #as  the memmory is only runtime use sqlite
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import StateGraph
 
-
+class State(TypedDict):
+    graph_state: str
+    
 ################################################# PIPE CLASS #################################################
 class Pipeline:
     """
@@ -47,9 +60,8 @@ class Pipeline:
         TOKEN: str 
         OPEN_WEB_UI_BASE_URL: str 
         OLLAMA_BASE_URL: str 
-        OPENAI_BASE_URL: str 
+        OPENAI_BASE_URL: str  #llama.cpp model access
         MODEL: str 
-
         # Debugging and processing settings
         DEBUG: bool = False
         NUM_RE_PROCESS: int 
@@ -86,8 +98,11 @@ class Pipeline:
         # Agent name identifier
         self.name = "Agentic_HR"
         self.token = self.valves.TOKEN
-
-
+        self.debug(f"Token __INIT__ :{self.token}")
+        self.debug('-' * 50)
+        self.NO_of_all_files_uploaded = len(self.get_file_ids_names_for_selected_user(None,self.token)) #logic crashes when tehre are parallel users
+        self.debug(f"NO of all files uploaded before the pipeline start :{self.NO_of_all_files_uploaded}")
+        self.debug('-' * 50)
         # Runtime memory to temporarily store parsed requirements by chat -> no need after DB integration
         self.memory_requirments_dict = {}
 
@@ -103,6 +118,8 @@ class Pipeline:
         # Set initial internal state of the agent
         self.state = "REQUIRMENTS_UPDATE" #within the pipe function it checks and update
         
+        self.threads = {} # contain chat_id : thread id
+        self.graphs = {} # contain chat_id : graph_obj
     async def on_startup(self):
         # This function is called when the server is started.
         print(f"AGENT_ON:{__name__}")
@@ -114,7 +131,7 @@ class Pipeline:
         pass
         
         
-    def debug(self, *args, **kwargs):
+    def debug(self, *args, **kwargs) -> None:
         """
         Prints debug messages if DEBUG mode is enabled in the valves configuration.
         Parameters:
@@ -122,6 +139,147 @@ class Pipeline:
         """
         if self.valves.DEBUG:
             print(*args, **kwargs)
+            
+    def get_file_ids_names_for_selected_user(self,user_id: str, token: str) -> list:
+        """
+        Get all uploaded files with their IDs and names.
+        Returns:
+            List of dictionaries for a given user: [{id1: name1}, {id2: name2}, ...]
+            
+        If no user is being present it return all the files
+        """
+
+        url = f'{self.valves.OPEN_WEB_UI_BASE_URL}/files/'
+        headers = {
+            'accept': 'application/json',
+            'Authorization': f'Bearer {token}'
+        }
+    
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            files = response.json()
+            if user_id:
+                file_names = [{file['id']:file['filename']} for file in files[:] if file['user_id']==user_id] 
+            else:
+                file_names =  [{f['id']: f['filename']} for f in files]
+            return file_names
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            return []   
+    
+    def requirements_test(self, state: State) -> Literal["requirements_updated","interrupt_node"]:
+        """
+        Validates the input requirements string.
+
+        Each line in the string must be in the format: <requirement>,<rating>
+        where rating is an integer from 1 to 5.
+
+        Parameters:
+        - requirements (str): Multiline string with requirements.
+        - chat_id: Chat identifier (not used in this version but may store data later).
+
+        Returns:
+        - bool: True if requirements are valid (error rate ≤ 10%), else False.
+        """
+        requirements = state["graph_state"]
+        
+        error_line_count = 0
+        error_percentage = 0.10  # Maximum allowed error: 10%
+        error_limit = int(len(requirements.splitlines()) * error_percentage)
+
+        if len(requirements) == 0:
+            return False
+
+        for line in requirements.splitlines():
+            pattern = r'^(.+?),\s*([1-5])$'
+            match = re.match(pattern, line.strip())
+            if match:
+                text = match.group(1).strip()
+                rating = int(match.group(2))
+                # You may update memory here using chat_id if needed
+            else:
+                print(f"Invalid format in line: {line}")
+                error_line_count += 1
+
+        return "requirements_updated" if error_line_count <= error_limit else "interrupt_node"
+
+    
+    def Begin_node(self, state: State):
+        print("-- Graph begin --")
+        return {"graph_state": state['graph_state']}
+
+    def General_node(self, state: State):
+        print("G e n e r a l")
+        ...
+    
+    def requirements_updated(self, state: State):
+        print("-- requirements_updated --")
+        return {"graph_state": state['graph_state']}
+    
+    def CV_processor(self, state: State):
+        print("-- CV_processor --")
+        return {"graph_state": state['graph_state']}
+    
+    def interrupt_node(self, state: State):
+        print("-- interrupt_node --")
+        return {"graph_state": state['graph_state']}
+    
+    def graph_builder(self) -> dict:
+        
+        builder = StateGraph(State)
+        # Define nodes: these do the work
+        builder.add_node("Begin_node", self.Begin_node)
+        builder.add_node("interrupt_node", self.interrupt_node)
+        builder.add_node("requirements_updated", self.requirements_updated)
+        builder.add_node("General_node", self.General_node)
+        builder.add_node("CV_processor",self.CV_processor)
+        
+        # Logic
+        builder.add_edge(START, "Begin_node")
+        builder.add_conditional_edges("Begin_node", self.requirements_test)
+        builder.add_edge("interrupt_node", "General_node")
+        builder.add_edge("requirements_updated", "CV_processor")
+        builder.add_edge("CV_processor", END)
+        builder.add_edge("General_node", END)
+        
+        # Persistent checkpointer: saved in a local SQLite file
+        checkpointer = SqliteSaver.from_conn_string("sqlite:///chat_memory.db")
+        memory = MemorySaver()
+        graph = builder.compile(interrupt_before=['interrupt_node'],checkpointer=memory)
+        return graph
+        ...      
+            
+    def get_current_chat_id(self, token) -> str:
+        """
+        Fetches the latest (most recent) chat ID from the conversation list
+        using the Open WebUI API endpoint. This represents the ongoing chat.
+
+        Args:
+            token (str): Bearer token for authentication.
+
+        Returns:
+            str: Chat ID of the latest conversation, or [] on error.
+        """
+        url = f'{self.valves.OPEN_WEB_UI_BASE_URL}/chats/list?page=1'  # Retrieves most recent chats (first page)
+        headers = {
+            'accept': 'application/json',
+            'Authorization': f'Bearer {token}'
+        }
+
+        response = requests.get(url, headers=headers)
+
+        if response.status_code == 200:
+            chat = response.json()
+            chat_id = chat[0]['id']
+            return chat_id
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            return []        
+            
+            
+            
+            
     ################################################ pipe ######################################################
 # ----------------------------------------------------------------------------
 # pipe function is going to run always when a new message is being prompted
@@ -162,7 +320,85 @@ class Pipeline:
         user_id = (body["user"]["id"])
         self.debug(f"user_id :{user_id}")
         self.debug('-' * 50)
-        # ----------------------------------------------------------------------------
-        # INITIAL STATE AND FILE COUNT CHECKING
         
-        return user_message
+        # Get the uploaded file ids -> issue: not specific with user parallel file upload can be a issue ------------------------------------------------
+        all_files_uploaded = self.get_file_ids_names_for_selected_user(None,self.token)
+        self.debug(f"all_files_uploaded :{all_files_uploaded}")
+        self.debug('-' * 50)
+        NO_of_all_files_uploaded = len(self.get_file_ids_names_for_selected_user(user_id,self.token))
+        self.debug(f"NO of all files uploaded by this user :{NO_of_all_files_uploaded}")
+        self.debug('-' * 50)
+        self.debug(f"self.NO_of_all_files_uploaded: {self.NO_of_all_files_uploaded}")
+        self.debug('-' * 50)
+        No_of_files_uploaded_for_processing = NO_of_all_files_uploaded - self.NO_of_all_files_uploaded
+        self.debug(f"NO of all files uploaded for processing: {No_of_files_uploaded_for_processing}")
+        self.debug('-' * 50)
+        self.NO_of_all_files_uploaded = NO_of_all_files_uploaded
+        
+        chat_id = self.get_current_chat_id(token=self.token)
+        self.debug(f"get_current_chat_id: {chat_id}")
+        self.debug('-' * 50)
+        #Initialize the llm based on langgraph ------------------------------------------------
+        llm = ChatOpenAI(
+            model = self.valves.MODEL,
+            base_url = f"{self.valves.OPENAI_BASE_URL}/v1",
+            api_key = self.token #accesing owui and it handles the rest
+        )
+        
+        #Test model invocation ------------------------------------------------
+        if False: #if self.valves.DEBUG
+            try:
+                sys_msg = SystemMessage(content="You Task is to verify that you get the user message to do that response wit the same user message")
+                response = llm.invoke([sys_msg] + [HumanMessage(content = user_message)])
+                self.debug(f"LLM Works fine: {response.content}")
+                self.debug('-' * 50)
+            except Exception as e:
+                self.debug(f"LLM invocation failed: {e}")
+        
+        #input
+        message = {"graph_state": user_message}
+        if chat_id in self.graphs:
+            graph = self.graphs[chat_id]
+            self.debug(f"Graph is available: {self.graphs[chat_id]}")
+            self.debug('-' * 50)
+            if chat_id in self.threads:
+                thread = self.threads[chat_id]
+                self.debug(f"chat_id is in the thread: {thread}")
+                self.debug('-' * 50)
+            else:
+                thread = {"configurable": {"thread_id": "1"}}
+                self.threads[chat_id] = thread
+                self.debug(f"chat_id is NOT in the thread: {thread}")
+                self.debug('-' * 50)
+        else:
+            
+            graph = self.graph_builder()
+            self.graphs[chat_id] = graph
+            self.debug(f"Graph Creation: {graph}")
+            self.debug('-' * 50)
+            thread = {"configurable": {"thread_id": "1"}}
+            self.threads[chat_id] = thread
+            self.debug(f"chat_id is NOT in the thread: {thread}")
+            self.debug('-' * 50)
+            
+        state = graph.get_state(thread)
+        self.debug(f"state of the graph : {state}")
+        self.debug('-' * 50)
+        if state.next == "interrupt_node":
+            self.debug(f"interrupt_node ")
+            self.debug('-' * 50)
+            graph.update_state(thread, {"graph_state": 
+                                user_message}, as_node="interrupt_node")
+            message = None
+        for event in graph.stream(message, thread, stream_mode="values"):
+            # Review
+            print(f"event:{event}")
+            # Get state and look at next node
+            state = graph.get_state(thread)
+            self.debug(f"state of the graph : {state}")
+            self.debug('-' * 50)
+            state.next
+            self.debug(f"NEXT state of the graph : {state.next}")
+            self.debug('-' * 50)
+
+        return "pass"
