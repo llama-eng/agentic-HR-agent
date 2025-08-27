@@ -30,7 +30,7 @@ from langgraph.graph import StateGraph
 
 class State(TypedDict):
     graph_state: str
-    
+    current_node: str
 ################################################# PIPE CLASS #################################################
 class Pipeline:
     """
@@ -203,27 +203,70 @@ class Pipeline:
                 error_line_count += 1
 
         return "requirements_updated" if error_line_count <= error_limit else "interrupt_node"
+    
+    def is_general(self, state: State) -> Literal["General_node","Begin_node"]:
+        """
+        check whether the user need to move with the general stage
+        """
+        user_message = state["graph_state"]
+        return "General_node" if (user_message.lower()=="yes") else "Begin_node"
 
     
     def Begin_node(self, state: State):
         print("-- Graph begin --")
-        return {"graph_state": state['graph_state']}
+        state["current_node"] = "Begin_node"
+        return state
 
     def General_node(self, state: State):
         print("G e n e r a l")
+        state["current_node"] = "General_node"
+        return state                      #{"graph_state": state['graph_state']}
         ...
+        
+    def General_chat_test_node(self, state: State):
+        print("General_chat_test_node")
+        state["current_node"] = "General_chat_test_node"
+        user_message = state["graph_state"]
+        llm = ChatOpenAI(
+            model = self.valves.MODEL,
+            base_url = f"{self.valves.OPENAI_BASE_URL}/v1",
+            api_key = self.token #accesing owui and it handles the rest
+        )
+        human_message = user_message
+        system_message = "You are an Human Resource agent, your task is to reply user with wam greeting which is less than 50 words"
+        response = llm.invoke([SystemMessage(content=system_message)]+[HumanMessage(content=human_message)])
+        state["graph_state"] = response.content
+        return state
     
     def requirements_updated(self, state: State):
         print("-- requirements_updated --")
-        return {"graph_state": state['graph_state']}
+        state["current_node"] = "requirements_updated"
+        return state
     
     def CV_processor(self, state: State):
         print("-- CV_processor --")
-        return {"graph_state": state['graph_state']}
+        state["current_node"] = "CV_processor"
+        return state
     
     def interrupt_node(self, state: State):
         print("-- interrupt_node --")
-        return {"graph_state": state['graph_state']}
+        state["current_node"] = "interrupt_node"
+        return state
+    
+    def General_chat_node(self, state: State): #use global token - pipeline class
+        print("General_chat_node")
+        state["current_node"] = "General_chat_node" # as this is a interrupt node this function won't call
+        user_message = state["graph_state"]
+        llm = ChatOpenAI(
+            model = self.valves.MODEL,
+            base_url = f"{self.valves.OPENAI_BASE_URL}/v1",
+            api_key = self.token #accesing owui and it handles the rest
+        )
+        human_message = user_message
+        system_message = "You are an Human Resource agent, your task is to reply user message with words less than 100"
+        response = llm.invoke([SystemMessage(content=system_message)]+[HumanMessage(content=human_message)])
+        state["graph_state"] = response.content
+        return state
     
     def graph_builder(self) -> dict:
         
@@ -234,19 +277,22 @@ class Pipeline:
         builder.add_node("requirements_updated", self.requirements_updated)
         builder.add_node("General_node", self.General_node)
         builder.add_node("CV_processor",self.CV_processor)
-        
+        builder.add_node("General_chat_test_node",self.General_chat_test_node)
+        builder.add_node("General_chat_node",self.General_chat_node)
         # Logic
         builder.add_edge(START, "Begin_node")
         builder.add_conditional_edges("Begin_node", self.requirements_test)
-        builder.add_edge("interrupt_node", "General_node")
+        builder.add_conditional_edges("interrupt_node", self.is_general)
+        builder.add_edge("General_node","General_chat_test_node")
         builder.add_edge("requirements_updated", "CV_processor")
         builder.add_edge("CV_processor", END)
-        builder.add_edge("General_node", END)
+        builder.add_edge("General_chat_test_node", "General_chat_node")
+        builder.add_edge("General_chat_node", END)
         
         # Persistent checkpointer: saved in a local SQLite file
         checkpointer = SqliteSaver.from_conn_string("sqlite:///chat_memory.db")
         memory = MemorySaver()
-        graph = builder.compile(interrupt_before=['interrupt_node'],checkpointer=memory)
+        graph = builder.compile(interrupt_before=['interrupt_node',"General_chat_node"],checkpointer=memory)
         return graph
         ...      
             
@@ -302,7 +348,7 @@ class Pipeline:
         # ----------------------------------------------------------------------------
         # DEBUG AND PIPE ACTIVATION LOG
         # ----------------------------------------------------------------------------
-        
+        user_output = "This is a test message" # o/p message send into the ui
         print(body)
         
         if self.valves.DEBUG:
@@ -356,7 +402,7 @@ class Pipeline:
                 self.debug(f"LLM invocation failed: {e}")
         
         #input
-        message = {"graph_state": user_message}
+        message = {"graph_state": user_message, "current_node": "START"}
         if chat_id in self.graphs:
             graph = self.graphs[chat_id]
             self.debug(f"Graph is available: {self.graphs[chat_id]}")
@@ -384,21 +430,36 @@ class Pipeline:
         state = graph.get_state(thread)
         self.debug(f"state of the graph : {state}")
         self.debug('-' * 50)
-        if state.next == "interrupt_node":
-            self.debug(f"interrupt_node ")
+        if "interrupt_node" in state.next:
+            self.debug(f"interrupt_node- INTERRUPT")
             self.debug('-' * 50)
             graph.update_state(thread, {"graph_state": 
-                                user_message}, as_node="interrupt_node")
+                                user_message},as_node=state.values["current_node"]) #use as node to mention start node
+            message = None
+        elif "General_chat_node" in state.next:
+            self.debug(f"General_chat_node - INTERRUPT ")
+            self.debug('-' * 50)
+            graph.update_state(thread, {"graph_state": 
+                                user_message},as_node=state.values["current_node"] )
             message = None
         for event in graph.stream(message, thread, stream_mode="values"):
-            # Review
+            # Review-> events are the messages passing through each edges
             print(f"event:{event}")
             # Get state and look at next node
             state = graph.get_state(thread)
             self.debug(f"state of the graph : {state}")
             self.debug('-' * 50)
-            state.next
+            if "interrupt_node" in state.next:
+                user_output = "Please re-submit the requirements \n Else do you want to have a genral chat ? (yes/no)"
+            elif "General_node" == event["current_node"]:
+                user_output = "This is a general chat with the llm please provide your question?"
+            elif "General_chat_test_node" == event["current_node"]:
+                user_output = event["graph_state"]    
+            elif "General_chat_node" == event["current_node"]:
+                user_output = event["graph_state"] 
             self.debug(f"NEXT state of the graph : {state.next}")
             self.debug('-' * 50)
-
-        return "pass"
+            self.debug(f"user_output: {user_output} , ")
+            self.debug('-' * 50)
+            
+        return user_output
